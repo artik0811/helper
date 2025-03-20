@@ -1,35 +1,52 @@
-use std::{fmt::Display, fs::File, io::{self, BufRead, BufReader, Write}, process::{Command, Stdio}};
+use std::{fmt::Display, fs::File, io::{self, BufRead, BufReader, Stdout, Write}, process::{Child, Command, Stdio}, thread};
 
 
 use crossterm::{event::{KeyCode, KeyModifiers}, execute, terminal::{Clear, ClearType}};
 use ratatui::{
-    buffer::Buffer, 
-    layout::{Alignment, Constraint, Layout, Rect}, 
-    style::{
+    buffer::Buffer, layout::{Alignment, Constraint, Layout, Rect}, prelude::CrosstermBackend, style::{
         palette::{material::BLACK, tailwind}, Color, Modifier, Style, Styled, Stylize
-    }, 
-    symbols, 
-    text::{Line, Span}, 
-    widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, StatefulWidget, Tabs, Widget}, 
-    DefaultTerminal
+    }, symbols, text::{Line, Span}, widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, StatefulWidget, Tabs, Widget}, DefaultTerminal
 };
 use itertools::Itertools;
 use strum::IntoEnumIterator;
 use strum_macros::{EnumIter, FromRepr};
+// use tokio::net::unix::pipe::{Receiver, Sender};
+use std::sync::mpsc;
 
 
 fn main() -> io::Result<()>{
     let mut terminal = ratatui::init();
-    let app = App {exit: AppState::Running, command_list: CommandList::new(), command_running: false};
+    let childproc = ChildProc::new();
+
+    let app = App {exit: AppState::Running, command_list: CommandList::new(), command_running: false, child: childproc};
     let app_result = app.run(&mut terminal);
     ratatui::restore();
+
     app_result
 }
 
 struct App {
     exit: AppState,
     command_list: CommandList,
-    command_running: bool
+    command_running: bool,
+    child: ChildProc
+}
+struct ChildProc {
+    tx: std::sync::mpsc::Sender<String>,
+    rx: std::sync::mpsc::Receiver<String>,
+    output: Vec<String>,
+}
+
+impl ChildProc {
+    fn new () -> Self {
+        let (tx, rx) = mpsc::channel();
+        let child_output:Vec<String> = Vec::new();
+        Self {
+            tx: tx,
+            rx: rx,
+            output: child_output
+        }
+    }
 }
 
 #[derive(Default, PartialEq)]
@@ -77,7 +94,6 @@ impl CommandList {
             let item = CommandItem::new(lines.unwrap());
             config.push(item);
         }
-        
 
         Self {
             state: ListState::default(),
@@ -90,8 +106,23 @@ impl App {
     fn run (mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while self.exit == AppState::Running {
             // if (!self.command_running) {
-                terminal.draw(|frame | 
-                    frame.render_widget(&mut self, frame.area())
+                while let Ok(line) = self.child.rx.try_recv() {
+                    self.child.output.push(line);
+                    // Ограничиваем количество строк для предотвращения переполнения
+                    if self.child.output.len() > 20 {
+                        self.child.output.remove(0);
+                    }
+                }
+                terminal.draw(|frame | {
+                    if self.command_running {
+                        let area = frame.area();
+                        let text: Vec<Line> = self.child.output.iter().map(|line| Line::from(line.as_str())).collect();
+                        let paragraph = Paragraph::new(text).block(Block::default().title("Process Output").borders(Borders::ALL));
+                        frame.render_widget(paragraph, area);
+                    } else {
+                        frame.render_widget(&mut self, frame.area())
+                    }
+                }
             )?; 
             // }
             match crossterm::event::read()? {
@@ -119,34 +150,44 @@ impl App {
         Ok(())
     }
 //todo: clear display, redraw rendered elements
-    fn run_selected_command (&mut self, terminal: &mut DefaultTerminal) {
-        self.command_running = true;
-        terminal.clear();
-        let mut x =terminal.backend();
-        let selected = self.command_list.state.selected().unwrap();
-        let arg = self.command_list.commands.get(selected).unwrap();
-        let mut child = Command::new(arg.item.clone())
+fn run_selected_command(&mut self, terminal: &mut DefaultTerminal) {
+    self.command_running = true;
+    terminal.clear().unwrap();
+    let selected = self.command_list.state.selected().unwrap();
+    let arg = self.command_list.commands.get(selected).unwrap();
+    let child = Command::new(arg.item.clone())
         .args(arg.args.clone())
-        .stdout(Stdio::piped()) // Перенаправляем stdout в канал
-        .spawn() // Запускаем процесс
-        .expect("Failed to start process");
-
-    // Получаем доступ к stdout дочернего процесса
-        let stdout = child.stdout.take().expect("Failed to open stdout");
-        let reader = BufReader::new(stdout);
-
-        // Читаем вывод построчно
-        for line in reader.lines() {
-            match line {
-                Ok(output) => &x.write_fmt(format_args!("{}", output)), // Выводим строку
-                Err(_) =>  &x.write_fmt(format_args!("Error")),
-            };
+        .stdout(Stdio::piped())
+        .spawn();
+    match child {
+        Ok(mut child) => {
+            let stdout = child.stdout.take().expect("Failed to open stdout");
+            let tx = self.child.tx.clone(); // Клонируем передатчик канала
+            let handler = thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    if let Ok(output) = line {
+                        // Отправляем строку в канал
+                        tx.send(output).expect("Failed to send data through channel");
+                    }
+                }
+            });
+            let exit_status = child.wait().expect("Failed to wait on child process");
+            handler.join();
+            loop {
+                
+            }
+            self.command_running = false;
         }
+        Err(error) => {
+            println!("Can't run child process: {}", error);
+            self.command_running = false;
+        }
+    }
+}
 
-        // Дожидаемся завершения процесса
-        let exit_status = child.wait().expect("Failed to wait on child process");
-
-        self.command_running = false;
+    fn read_child (childproc: ChildProc, mut child: Child) {
+        
     }
 
     fn select_next (&mut self)  {
